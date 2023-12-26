@@ -3,6 +3,15 @@
 동일 모델을 중복으로 사용하여 첫번째에는 document에서 해당 문서를 서치하는 데
 두번째에는 해당 문서에서 query에 해당하는 내용을 추출하는 데 사용
 
+1. context embedding을 document의 개별 문서 embedding 간의 코사인 유사도를 통해 비교하여
+가장 유사도가 높은 개별문서를 추출함
+2. 개별문서의 문장들을 list로 split한 다음 list 요소와 query를 vectorize하여서 다시 embedding 간의 코사인 유사도를 비교한 다음
+가장 유사도가 높은 문장을 추출함 (따로 Reader를 만들지 않음)
+모델은 1에서 썼던 모델을 2에서도 똑같이 사용함
+예를 들어, BM25 모델을 개별 문장을 추출하는 데 사용했다면,
+개별 문장을 split 한 다음 query와 리스트 내의 문장을 vectorize하는 데에도 BM25를 사용함
+유사도를 비교할 때에는 가장 유사도 알고리즘 중 가장 성능이 좋았던 코사인 유사도를 사용함
+
 - TF-IDF (Term Frequency-Inverse Document Frequency)
 문서 내에서 단어의 빈도와 그 단어가 다른 문서들에 걸쳐 얼마나 희귀한지를 고려하여 가중치를 계산함
 고전적인 방법론으로서 텍스트 검색에서 널리 사용되며 간단하고 효과적인 방법이지만 문맥이나 단어의 의미를 파악하지는 못함
@@ -25,7 +34,7 @@ TF-IDF의 확장으로 검색 쿼리와 문서 간의 관련성을 평가하는 
 질문에 가장 잘 맞는 문서를 찾는 데 효과적이며 특히 자연어 질의에 대한 정확한 답변 찾기에 적합함
 긴 문서를 읽고 이해하는 데 적합함
 
-- haystack
+- Haystack
 retrieval augmented generation을 위한 end to end library로서 Transformer와 vector search를 기반으로 함
 SQLite를 통해 document를 저장하고 TFIDFRetriever를 통해 document를 vectorize
 query 역시 같은 retriever를 통해 vectorize하고 query와 유사도가 높은 document를 내림차순으로 정렬하여 top_k만큼 추출함
@@ -81,9 +90,9 @@ from haystack.document_stores.sql import SQLDocumentStore
 #clear gpu memory cache
 
 gc.collect()
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:64"
-os.environ['CUDA_VISIBLE_DEVICES']='2, 3'
 torch.cuda.empty_cache()
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:1024"
+os.environ['CUDA_VISIBLE_DEVICES']='0, 1, 2'
 model = None
 jvmpath = jpype.getDefaultJVMPath()
 okt = Okt()
@@ -157,7 +166,7 @@ def converter(file_path):
         rawdata = f.read()
     encode = chardet.detect(rawdata)
 
-    with open(file_path, 'r', encoding=encode) as file:
+    with open(file_path, 'r', encoding=encode['encoding']) as file:
         content = file.read()
         
     with open(file_path, 'w', encoding='utf-8') as file:
@@ -165,6 +174,7 @@ def converter(file_path):
 
 # 2차 텍스트 정제 함수
 # 추출한 문서를 정제하는 데 사용되며 문장 하나가 리스트의 요소 하나의 역할을 함
+# stop words들을 걸러냄
 def deep_preprocess_text(text):  
     text = BeautifulSoup(text, 'html.parser').get_text(separator='', strip=True)
     tokens = text.split('\n')
@@ -174,7 +184,7 @@ def deep_preprocess_text(text):
     return tokens
 
 # 1차 텍스트 정제 함수 
-# html파일에서 쓸데없는 토큰들을 쳐낸 후 개행을 기준으로 텍스트를 요소 별로 분리하여 리스트로 추출
+# HTML tags, scripts, styles, and extra whitespace들을 쳐낸 후 개행을 기준으로 텍스트를 요소 별로 분리하여 리스트로 추출
 def preprocess_text(text): 
     text = re.sub(r'\[\[파일:[^\]]+\]\]', '', text)
     text = re.sub(r'\{\{[^\}]+\}\}', '', text)
@@ -212,8 +222,7 @@ def jaccard_similarity(doc1, doc2):
 
     return jaccard_similarity
 
-# 샘플로 주어진 txt 파일에 특성을 이용해 context (topic)으로 주어진 단어가 '''로 묶여 있다는 사실을 이용하여 정답 document를 추출
-# 100% 정확하지는 않고 context가 document 내에 없거나 사용자가 잘못 입력할 가능성이 있으므로 아래서는 try except 문을 사용함
+# 샘플로 주어진 txt 파일의 특성을 이용해 context(topic)가 '''로 묶여 있다는 사실을 이용하여 정답 document를 추출
 def golden_document(documents, query):
     query_with_quotes = f"'''{query}'''"
 
@@ -235,6 +244,7 @@ class RNNModel(nn.Module):
     def __init__(self, vocab_size, embed_dim, hidden_size, num_classes, batch_size):
         super(RNNModel, self).__init__()
         self.embedding = nn.Embedding(vocab_size, embed_dim)
+        # 긴 document 이므로 LSTM 모델을 사용
         self.rnn = nn.RNN(embed_dim, hidden_size, batch_first=True)
         self.dropout = nn.Dropout(0.5)
         self.fc = nn.Linear(hidden_size, num_classes)
@@ -261,8 +271,10 @@ class SearchModel:
 
         #Haystack
         haystack_documents = [{"content": text} for text in documents]
+        # SQLite를 사용해 document를 저장
         document_store = SQLDocumentStore(url="sqlite:///:memory:")
         document_store.write_documents(haystack_documents)
+        # TfidfRetriever를 통해서 retrieve (query와의 유사도 계산할 수 있도록)
         self.retriever = TfidfRetriever(document_store=document_store)
         
         # TF-IDF
@@ -270,9 +282,13 @@ class SearchModel:
         self.TFIDF_tfidf_matrix = self.tfidf_vectorizer.fit_transform(documents)
         
         # BM25
+        # token을 count하여 vectorized matrix로 변환할 수 있도록 초기화
         self.count_vectorizer = CountVectorizer()
+        # document의 토큰들을 vectorize
         self.term_freq_matrix = self.count_vectorizer.fit_transform(documents)
+        # TFIDFTransformer를 통해 유사도를 계산할 수 있게 초기화
         self.tfidf_transformer = TfidfTransformer()
+        # TFIDFTransformer에 fit하여서 유사도를 계산할 수 있도록 함
         self.bm25_tfidf_matrix = self.tfidf_transformer.fit_transform(self.term_freq_matrix)
 
         # DPR
@@ -297,6 +313,8 @@ class SearchModel:
         self.transformers_model = AutoModelForSequenceClassification.from_pretrained("beomi/KcELECTRA-base", num_hidden_layers=6,
                                                                        num_attention_heads=8)
         # Sentence Transformer Model
+        # paraphrase-MiniLM-L6-v2dms: 6레이어의 작은 구조를 가진 모델로 빠른 엑세스, 빠른 서치가 가능
+        # 임베딩 간의 semantic similarity를 빠르게 계산할 수 있는 모델
         self.sentence_transformer_model = SentenceTransformer('paraphrase-MiniLM-L6-v2')
 
         # SOTA Model
@@ -500,24 +518,14 @@ if __name__ == "__main__":
     converter(file_path)
     documents = read_korean_wikipedia_file(file_path)
     search_model = SearchModel(documents)
-    
-    while input('enter 0 to break or enter other word to move on: ') != '0':
-        # 일단 query를 입력
-        query = input("enter your search query: ")
-        # query에 맞는 context (topic)을 입력
-        contexts = input("enter your topic of search query: ")
-        messages = [{"role": "context", "content": context} for context in contexts]
-        messages.append({"role": "user", "content": query})
-       
-        # t5 search (reader)
-        input_q = json.dumps({
-        "model": "t5-small-fid",
-        "mode": "", 
-        "messages": messages})
-        response = requests.post('http://211.39.140.48:9090/predictions/temp', data=input_q)
-        t5_prediction_result = response.json()
-        print("\nT5-large Prediction Result:", t5_prediction_result)
-        # 모델 별로 결과값을 추출하게 함
+    context_list = []
+    top_k = 1
+    if input('enter 0 to move on or enter other word to evaludate models: ') != '0':
+        for document in documents:
+            # 검색 할 수 있는 단어들을 전부 list에 넣음 (빈 문자열은 제외)
+            matches = re.findall(r"'''(.+?)'''", document)
+            context_list.extend(matches)
+            print(context_list)
         for n, (model_name, search_function) in enumerate([
             ("TF-IDF", search_model.tfidf_search), # 기본 모델
             ("BM25", search_model.bm25_search), # 기본 모델
@@ -531,141 +539,256 @@ if __name__ == "__main__":
             ("MSMARCO DistilBERT", search_model.msmarco_search), # pretrained model, finetuned
             ("Paraphrase-MPNet", search_model.paraphrase_mpnet_search), # pretrained model, finetuned
         ]):
-            top_k = 1
-            try:
-                result = search_function(contexts, top_k=top_k)
-            # context를 아예 찾지 못할 경우를 대비해서 try except문을 사용
-            except TypeError as e:
-                print(e)
-                result = []
-                print('0%')
-                continue
-            except ValueError as e:
-                print(e)
-                result = []
-                print('0%')
-                continue
-            # 결과물 추출 (여기에서의 결과물이란 document에서 해당하는 context에 관한 문서임)
-            print(f"\n{model_name} Search in Document:", result)
-            print('')
-            try:
-                # 아까 설정했던 정답 문서 추출하는 함수
-                # wekipedia라고 모든 topic이 있진 않으므로 검색에 실패할 경우를 대비해 try except
-                GoldenDocument = golden_document(documents, contexts)
-                similarity = jaccard_similarity(result[0], GoldenDocument)
-                print(f"\n{model_name}'s similarity to a label document: {similarity:.2%}\n")
-            except Exception as e:
-                similarity = 1
-                print(e)
-                print("can't find the topic in the document. please write the right word for searching in the document")
-            # 추출된 result document element 그러니까 context에 해당하는 문서에서 query에 해당하는 부분을 다시 serach하여 출력하는 부분임
-            if similarity * 10 > 1:
-                # document에서 context 단어에 해당하는 문서를 찾고 그 문서에서 다시 query에 해당하는 part를 찾음
-                # 처음에는 GPT랑 랭체인을 통해 QA를 하려 했으나 잘 안되서 search model을 한번 더 써보기로 함
-                # search 모델을 reader 모델로 쓰는 것이 가장 효과가 좋았음
-                # 변수를 쓰려고했더니 파이썬에서 이를 class의 함수로 인식을 해버려서 그냥 새로 deep search model을 만듦
-                # 구조는 같음
+            TFIDF_similarity = 0
+            BM25_similarity = 0
+            InvertedIndex_similarity = 0
+            Haystack_similarity = 0
+            RNN_similarity = 0
+            DPR_similarity = 0
+            Transformers_similarity = 0
+            SentenceTransformers_similarity = 0
+            KSCRoberta_similarity = 0
+            MSMARCO_similarity = 0
+            Paraphrase_similarity = 0
+            
+            for m, context in enumerate(context_list):
                 try:
-                    # enumerate를 통해 인덱스를 추출한다음 같은 모델을 중복하여 사용함
-                    # 1번: TF-IDF
-                    if n == 1:
-                        candidate_list = deep_preprocess_text(result[0])
-                        deep_search_model = SearchModel(candidate_list)
-                        ans = deep_search_model.tfidf_search(query, top_k=top_k)
-                        print(f"\n{model_name}'s answer in Document:", ans)
-                        print('')
-                    # 2번 BM25
-                    elif n == 2:
-                        candidate_list = deep_preprocess_text(result[0])
-                        deep_search_model = SearchModel(candidate_list)
-                        ans = deep_search_model.bm25_search(query, top_k=top_k)
-                        print(f"\n{model_name}'s answer in Document:", ans)
-                        print('')
-                    # 3번 Inverted Index
-                    elif n == 3:
-                        candidate_list = deep_preprocess_text(result[0])
-                        deep_search_model = SearchModel(candidate_list)
-                        ans = deep_search_model.inverted_index_search(query, top_k=top_k)
-                        print(f"\n{model_name}'s answer in Document:", ans)
-                        print('')
-                    # 4번 Haystack
-                    elif n == 4:
-                        candidate_list = deep_preprocess_text(result['content'])
-                        deep_search_model = SearchModel(candidate_list)
-                        ans = deep_search_model.haystack_search(query, top_k=top_k)
-                        print(f"\n{model_name}'s answer in Document:", ans)
-                        print('')
-                   # 5번 RNN
-                    elif n == 5:
-                        candidate_list = deep_preprocess_text(result[0])
-                        deep_search_model = SearchModel(candidate_list)
-                        ans = deep_search_model.rnn_search(query, top_k=top_k)
-                        print(f"\n{model_name}'s answer in Document:", ans)
-                        print('')
-                    # 6번 DPR
-                    elif n == 6:
-                        candidate_list = deep_preprocess_text(result[0])
-                        deep_search_model = SearchModel(candidate_list)
-                        ans = deep_search_model.dpr_search(query, top_k=top_k)
-                        print(f"\n{model_name}'s answer in Document:", ans)
-                        print('')
-                    # 7번 Transformers
-                    elif n == 7:
-                        candidate_list = deep_preprocess_text(result[0])
-                        deep_search_model = SearchModel(candidate_list)
-                        ans = deep_search_model.transformers_search(query, top_k=top_k)
-                        print(f"\n{model_name}'s answer in Document:", ans)
-                        print('')
-                    # 8번 Sentence Transforemrs
-                    elif n == 8:
-                        candidate_list = deep_preprocess_text(result[0])
-                        deep_search_model = SearchModel(candidate_list)
-                        ans = deep_search_model.sentence_transformers_search(query, top_k=top_k)
-                        print(f"\n{model_name}'s answer in Document:", ans)
-                        print('')
-                    # 9번 KSCRoberTa (SOTA, Sentence Transformers 기반)
-                    elif n == 9:
-                        candidate_list = deep_preprocess_text(result[0])
-                        deep_search_model = SearchModel(candidate_list)
-                        ans = deep_search_model.KSCRoberta_search(query, top_k=top_k)
-                        print(f"\n{model_name}'s answer in Document:", ans)
-                        print('')
-                    # 10번 msmarco (SOTA, Sentence Transformers 기반)
-                    elif n == 10:
-                        candidate_list = deep_preprocess_text(result[0])
-                        deep_search_model = SearchModel(candidate_list)
-                        ans = deep_search_model.msmarco_search(query, top_k=top_k)
-                        print(f"\n{model_name}'s answer in Document:", ans)
-                        print('')
-                    # 11번 paraphrase mpnet (SOTA, Sentence Transformers 기반)
-                    else:
-                        candidate_list = deep_preprocess_text(result[0])
-                        deep_search_model = SearchModel(candidate_list)
-                        ans = deep_search_model.paraphrase_mpnet_search(query, top_k=top_k)
-                        print(f"\n{model_name}'s answer in Document:", ans)
-                        print('')
-                    time.sleep(100)
-                # 결과물이 너무 빨리 넘어가서 time.sleep 메서드를 사용함
-                # 마찬가지로 결과물을 못찾을 경우를 대비하여 try except 문을 사용
+                    result = search_function(context, top_k=top_k)
+                # context를 아예 찾지 못할 경우를 대비해서 try except문을 사용
                 except TypeError as e:
                     print(e)
-                    print("[]")
-                    time.sleep(100)
+                    result = []
+                    print('0%')
                     continue
                 except ValueError as e:
                     print(e)
-                    print("[]")
-                    time.sleep(100)
+                    result = []
+                    print('0%')
                     continue
-                except RuntimeError as e:
+                GoldenDocument = golden_document(documents, context)
+                m += 1
+                # 1번 TF-IDF
+                if n == 1:
+                    print(GoldenDocument, context)
+                    TFIDF_similarity += jaccard_similarity(result[0], GoldenDocument)
+                    TFIDF_similarity = TFIDF_similarity / m
+                    print(f"\naverage {model_name}'s similarity to a label document: {TFIDF_similarity:.2%}\n")
+                # 2번 BM25
+                elif n == 2:
+                    BM25_similarity += jaccard_similarity(result[0], GoldenDocument)
+                    BM25_similarity = BM25_similarity / m
+                    print(f"\naverage {model_name}'s similarity to a label document: {BM25_similarity:.2%}\n")
+                # 3번 Inverted Index
+                elif n == 3:
+                    InvertedIndex_similarity += jaccard_similarity(result[0], GoldenDocument)
+                    InvertedIndex_similarity = InvertedIndex_similarity / m
+                    print(f"\naverage {model_name}'s similarity to a label document: {InvertedIndex_similarity:.2%}\n")
+                # 4번 Haystack
+                elif n == 4:
+                    Haystack_similarity += jaccard_similarity(result[0], GoldenDocument)
+                    Haystack_similarity = Haystack_similarity / m
+                    print(f"\naverage {model_name}'s similarity to a label document: {Haystack_similarity:.2%}\n")
+                # 5번 RNN
+                elif n == 5:
+                    RNN_similarity += jaccard_similarity(result[0], GoldenDocument)
+                    RNN_similarity = RNN_similarity / m
+                    print(f"\naverage {model_name}'s similarity to a label document: {RNN_similarity:.2%}\n")
+                # 6번 DPR
+                elif n == 6:
+                    DPR_similarity += jaccard_similarity(result[0], GoldenDocument)
+                    DPR_similarity = DPR_similarity / m
+                    print(f"\naverage {model_name}'s similarity to a label document: {DPR_similarity:.2%}\n")
+                # 7번 Transformers
+                elif n == 7:
+                    Transformers_similarity += jaccard_similarity(result[0], GoldenDocument)
+                    Transformers_similarity = Transformers_similarity / m
+                    print(f"\naverage {model_name}'s similarity to a label document: {Transformers_similarity:.2%}\n")
+                # 8번 Sentence Transforemrs
+                elif n == 8:
+                    SentenceTransformers_similarity += jaccard_similarity(result[0], GoldenDocument)
+                    SentenceTransformers_similarity = SentenceTransformers_similarity / m
+                    print(f"\naverage {model_name}'s similarity to a label document: {SentenceTransformers_similarity:.2%}\n")
+                # 9번 KSCRoberTa (SOTA, RoberTa 기반)
+                elif n == 9:
+                    KSCRoberta_similarity += jaccard_similarity(result[0], GoldenDocument)
+                    KSCRoberta_similarity = KSCRoberta_similarity / m
+                    print(f"\naverage {model_name}'s similarity to a label document: {KSCRoberta_similarity:.2%}\n")
+                # 10번 msmarco (SOTA, BERT 기반)
+                elif n == 10:
+                    MSMARCO_similarity += jaccard_similarity(result[0], GoldenDocument)
+                    MSMARCO_similarity = MSMARCO_similarity / m
+                    print(f"\naverage {model_name}'s similarity to a label document: {MSMARCO_similarity:.2%}\n")
+                # 11번 paraphrase mpnet (SOTA, mpnet 기반)
+                else:
+                    Paraphrase_similarity += jaccard_similarity(result[0], GoldenDocument)
+                    Paraphrase_similarity = Paraphrase_similarity / m
+                    print(f"\naverage {model_name}'s similarity to a label document: {Paraphrase_similarity:.2%}\n")        
+    
+        print(TFIDF_similarity)
+        print(BM25_similarity)
+        print(InvertedIndex_similarity)
+        print(Haystack_similarity)
+        print(RNN_similarity)
+        print(DPR_similarity)
+        print(Transformers_similarity)
+        print(SentenceTransformers_similarity)
+        print(KSCRoberta_similarity)
+        print(MSMARCO_similarity)
+        print(Paraphrase_similarity)
+    
+    else:
+        while input('enter 0 to break or enter other word to move on: ') != '0':
+            # 일단 query를 입력
+            query = input("enter your search query: ")
+            # query에 맞는 context (topic)을 입력
+            contexts = input("enter your topic of search query: ")
+            messages = [{"role": "context", "content": context} for context in contexts]
+            messages.append({"role": "user", "content": query})
+            # t5 search (reader)
+            input_q = json.dumps({
+            "model": "t5-small-fid",
+            "mode": "", 
+            "messages": messages})
+            response = requests.post('http://211.39.140.48:9090/predictions/temp', data=input_q)
+            t5_prediction_result = response.json()
+            print("\nT5-large Prediction Result:", t5_prediction_result)
+            # 모델 별로 결과값을 추출하게 함
+            for n, (model_name, search_function) in enumerate([
+                ("TF-IDF", search_model.tfidf_search), # 기본 모델
+                ("BM25", search_model.bm25_search), # 기본 모델
+                ("Inverted Index", search_model.inverted_index_search), # 기본 모델
+                ("Haystack", search_model.haystack_search), # 기본 모델
+                ("RNN", search_model.rnn_search), # 기본모델, 학습 o
+                ("DPR", search_model.dpr_search), # finetuned model, 학습 x
+                ("Transformers", search_model.transformers_search), # finetuned model, 학습 x
+                ("Sentence Transformers", search_model.sentence_transformers_search), # finetuned model, 학습 x
+                ("KSCRoberta Search", search_model.KSCRoberta_search), # pretrained model, finetuned
+                ("MSMARCO DistilBERT", search_model.msmarco_search), # pretrained model, finetuned
+                ("Paraphrase-MPNet", search_model.paraphrase_mpnet_search), # pretrained model, finetuned
+            ]):
+                try:
+                    result = search_function(contexts, top_k=top_k)
+                # context를 아예 찾지 못할 경우를 대비해서 try except문을 사용
+                except TypeError as e:
                     print(e)
-                    print("[]")
-                    time.sleep(100)
+                    result = []
+                    print('0%')
                     continue
-            else:
-                time.sleep(100)
-                print("[]")
-                continue
+                except ValueError as e:
+                    print(e)
+                    result = []
+                    print('0%')
+                    continue
+                # 결과물 추출 (여기에서의 결과물이란 document에서 해당하는 context에 관한 문서임)
+                print(f"\n{model_name} Search in Document:", result)
+                print('')
+                try:
+                    # 아까 설정했던 정답 문서 추출하는 함수
+                    # wekipedia라고 모든 topic이 있진 않으므로 검색에 실패할 경우를 대비해 try except
+                    GoldenDocument = golden_document(documents, contexts)
+                    similarity = jaccard_similarity(result[0], GoldenDocument)
+                    print(f"\n{model_name}'s similarity to a label document: {similarity:.2%}\n")
+                except Exception as e:
+                    similarity = 1
+                    print(e)
+                    print("can't find the topic in the document. please write the right word for searching in the document")
+                # 추출된 result document element 그러니까 context에 해당하는 문서에서 query에 해당하는 부분을 다시 serach하여 출력하는 부분임
+                if similarity * 10 > 1:
+                    # document에서 context 단어에 해당하는 문서를 찾고 그 문서에서 다시 query에 해당하는 part를 찾음
+                    # 처음에는 GPT랑 랭체인을 통해 QA를 하려 했으나 잘 안되서 search model을 한번 더 써보기로 함
+                    # search 모델을 reader 모델로 쓰는 것이 가장 효과가 좋았음
+                    # 변수를 쓰려고했더니 파이썬에서 이를 class의 함수로 인식을 해버려서 그냥 새로 deep search model을 만듦
+                    # 구조는 같음
+                    try:
+                        # enumerate를 통해 인덱스를 추출한다음 같은 모델을 중복하여 사용함
+                        # 1번: TF-IDF
+                        if n == 1:
+                            candidate_list = deep_preprocess_text(result[0])
+                            deep_search_model = SearchModel(candidate_list)
+                            ans = deep_search_model.tfidf_search(query, top_k=top_k)
+                            print(f"\n{model_name}'s answer in Document:", ans)
+                        # 2번 BM25
+                        elif n == 2:
+                            candidate_list = deep_preprocess_text(result[0])
+                            deep_search_model = SearchModel(candidate_list)
+                            ans = deep_search_model.bm25_search(query, top_k=top_k)
+                            print(f"\n{model_name}'s answer in Document:", ans)
+                        # 3번 Inverted Index
+                        elif n == 3:
+                            candidate_list = deep_preprocess_text(result[0])
+                            deep_search_model = SearchModel(candidate_list)
+                            ans = deep_search_model.inverted_index_search(query, top_k=top_k)
+                            print(f"\n{model_name}'s answer in Document:", ans)
+                        # 4번 Haystack
+                        elif n == 4:
+                            candidate_list = deep_preprocess_text(result['content'])
+                            deep_search_model = SearchModel(candidate_list)
+                            ans = deep_search_model.haystack_search(query, top_k=top_k)
+                            print(f"\n{model_name}'s answer in Document:", ans)
+                    # 5번 RNN
+                        elif n == 5:
+                            candidate_list = deep_preprocess_text(result[0])
+                            deep_search_model = SearchModel(candidate_list)
+                            ans = deep_search_model.rnn_search(query, top_k=top_k)
+                            print(f"\n{model_name}'s answer in Document:", ans)
+                        # 6번 DPR
+                        elif n == 6:
+                            candidate_list = deep_preprocess_text(result[0])
+                            deep_search_model = SearchModel(candidate_list)
+                            ans = deep_search_model.dpr_search(query, top_k=top_k)
+                            print(f"\n{model_name}'s answer in Document:", ans)
+                        # 7번 Transformers
+                        elif n == 7:
+                            candidate_list = deep_preprocess_text(result[0])
+                            deep_search_model = SearchModel(candidate_list)
+                            ans = deep_search_model.transformers_search(query, top_k=top_k)
+                            print(f"\n{model_name}'s answer in Document:", ans)
+                        # 8번 Sentence Transforemrs
+                        elif n == 8:
+                            candidate_list = deep_preprocess_text(result[0])
+                            deep_search_model = SearchModel(candidate_list)
+                            ans = deep_search_model.sentence_transformers_search(query, top_k=top_k)
+                            print(f"\n{model_name}'s answer in Document:", ans)
+                        # 9번 KSCRoberTa (SOTA, RoberTa 기반)
+                        elif n == 9:
+                            candidate_list = deep_preprocess_text(result[0])
+                            deep_search_model = SearchModel(candidate_list)
+                            ans = deep_search_model.KSCRoberta_search(query, top_k=top_k)
+                            print(f"\n{model_name}'s answer in Document:", ans)
+                        # 10번 msmarco (SOTA, BERT 기반)
+                        elif n == 10:
+                            candidate_list = deep_preprocess_text(result[0])
+                            deep_search_model = SearchModel(candidate_list)
+                            ans = deep_search_model.msmarco_search(query, top_k=top_k)
+                            print(f"\n{model_name}'s answer in Document:", ans)
+                        # 11번 paraphrase mpnet (SOTA, mpnet 기반)
+                        else:
+                            candidate_list = deep_preprocess_text(result[0])
+                            deep_search_model = SearchModel(candidate_list)
+                            ans = deep_search_model.paraphrase_mpnet_search(query, top_k=top_k)
+                            print(f"\n{model_name}'s answer in Document:", ans)
+                        time.sleep(100)
+                    # 결과물이 너무 빨리 넘어가서 time.sleep 메서드를 사용함
+                    # 마찬가지로 결과물을 못찾을 경우를 대비하여 try except 문을 사용
+                    except TypeError as e:
+                        print(e)
+                        print("[]")
+                        time.sleep(100)
+                        continue
+                    except ValueError as e:
+                        print(e)
+                        print("[]")
+                        time.sleep(100)
+                        continue
+                    except RuntimeError as e:
+                        print(e)
+                        print("[]")
+                        time.sleep(100)
+                        continue
+                else:
+                    time.sleep(100)
+                    print("[]")
+                    continue
 
 
 '''
